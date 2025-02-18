@@ -9,7 +9,6 @@ def get_backend():
         return 'ccl'
     return 'gloo'
 
-
 # def initialize_distributed_backend():
     # dist.init_process_group(backend=get_backend())
     # RANK = dist.get_rank()
@@ -34,3 +33,11 @@ def print_rank0(msg):
             print(f"{RANK}: {msg}")
     else:
         print(msg)
+
+
+def get_device_type():
+    if torch.cuda.is_available():
+        return 'cuda'
+    if torch.xpu.is_available():
+        return 'xpu'
+    return 'cpu'

@@ -2,7 +2,8 @@
 
 WORK_DIR="/c/Users/eugen/Codes/SWIN_parallelism"
 . "$WORK_DIR/venv/Scripts/activate"
-NRANKS_PER_NODE=4
+# NRANKS_PER_NODE=4
+NRANKS_PER_NODE=24
 cd $WORK_DIR
 
 echo SCRIPT_PTH: $SCRIPT_PTH
