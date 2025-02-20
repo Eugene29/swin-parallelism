@@ -1,21 +1,27 @@
-import torch
-import torch.distributed as dist
-from einops import rearrange
-import torch.distributed
-import torch.distributed.device_mesh
-# TODO: how to get this import to work inside test/
+# TODO: get this import to work inside test/
 from distributed_utils import (
     print_in_order, print_rank0, get_backend, get_device_type
 )
 from window_parallelism import window_parallel_shift
 from ulysses import _SeqAllToAll
 
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from einops import rearrange
+
+
+## TODO: follow the best practice and make the unit-test more modular
 def setup_window_parallelism(
     ulysses_degree=1, 
     window_parallelism_degree=1, 
-    data_parallel_degree=None,
 ):
-    r'''initialize toy data for window parallelism.'''
+    r'''initialize toy data for window parallelism.
+    
+        fully_sharded_input: 
+            (B, n_total_patches/wp/sp, hc, hs) if SP > 1 else: (B, n_row, n_col, hc, hs)
+    '''
     ## Initialize 3D device mesh
     world_size = dist.get_world_size()
     SP = ulysses_degree
@@ -24,8 +30,7 @@ def setup_window_parallelism(
     DP = world_size // SP // WP
     mesh_shape = [SP, WP, DP]
     device = get_device_type()
-    device_mesh = torch.distributed.device_mesh.init_device_mesh(device, mesh_shape, 
-                                                   mesh_dim_names=['SP', 'WP', 'DP'])
+    device_mesh = init_device_mesh(device, mesh_shape, mesh_dim_names=['SP', 'WP', 'DP'])
 
     ## Get ProcessGroup attributes
     sp_group = device_mesh.get_group('SP')
@@ -50,11 +55,9 @@ def setup_window_parallelism(
         'twice to return to the original grid'
 
     ## Derive other image related dimensions
-    shift_size = win_h//2, win_w//2
     n_row_patches, n_col_patches = patch_grid_size = n_row*win_h, n_col*win_w
     input_dim = (B, n_row_patches, n_col_patches, hc, hs)
     print_rank0(f"window_size: {window_size}")
-    print_rank0(f"shift_size: {shift_size}")
     print_rank0(f"num_row_patches: {n_row_patches}")
     print_rank0(f"num_col_patches: {n_col_patches}")
     print_rank0(f'Image dim can be ({n_row_patches}, {n_col_patches})'
@@ -64,7 +67,9 @@ def setup_window_parallelism(
     total_dim = 1
     for dim in input_dim:
         total_dim *= dim
-    input = torch.arange(total_dim).view(input_dim)  # TODO: set device, dtype?
+    # TODO: set device, dtype?
+    dtype = torch.get_default_dtype()
+    input = torch.arange(total_dim, dtype=dtype, requires_grad=True).view(input_dim)  
 
     ## Shard input by row -> (B, n_row_patches/wp, n_col_patches, hc, hs)
     assert n_row % WP == 0, \
@@ -87,7 +92,7 @@ def setup_window_parallelism(
     else:
         fully_sharded_input = row_partitioned_input
 
-    return input, fully_sharded_input, patch_grid_size, shift_size, comm_groups
+    return input, fully_sharded_input, patch_grid_size, window_size, comm_groups
 
 def test_intranode_window_parallel_shift():
     r'''tests window_parallel_shift
@@ -122,31 +127,57 @@ def test_intranode_window_parallel_shift():
     ## Init distributed backend
     dist.init_process_group(backend=get_backend())
     world_size = dist.get_world_size()
-    input, row_partitioned_input, patch_grid_size, shift_size, comm_groups = \
+    # input: (B, n_row_patches, n_col_patches, hc, hs)
+    # row_partitioned_input: (B, n_row_patches/wp, n_col_patches, hc, hs)
+    input, row_partitioned_input, patch_grid_size, window_size, comm_groups = \
         setup_window_parallelism(window_parallelism_degree=world_size)
     sp_group, wp_group, dp_group = comm_groups
-    wp_world_size = dist.get_world_size(wp_group)
+    win_h, win_w = window_size
+    shift_size = win_h//2, win_w//2
+    WP = dist.get_world_size(wp_group)
     
-    ## Normally shift image by shift_size
+    ## Normally shift image by shift_size -> ()
     shifted_input = torch.roll(input, (-shift_size[0], -shift_size[1]), dims=(1, 2))
-    print_rank0(f"input[0, :, :, 0, 0]:\n{input[0, :, :, 0, 0]}\n")
+    print_rank0(f"input[0, :, :, 0, 0]:\n{input[0, :, :, 0, 0].int()}\n")
     
     ## shift windows across GPUs using window_parallel_shift 
+    # -> (B, n_row_patches/wp, n_col_patches, hc, hs)
     shifted_row_input = window_parallel_shift(row_partitioned_input, shift_size, wp_group)
 
-    ## all-gather to verify the shift
-    out_lst = [torch.empty_like(shifted_row_input) for _ in range(wp_world_size)]
-    dist.all_gather(out_lst, shifted_row_input, wp_group)
-    gathered_shifted_input = torch.cat(out_lst, dim=1)
-
+    ## verify the shift with all-gather -> (B, n_row_patches/wp, n_col_patches, hc, hs)
+    nrow_dim = 1
+    out_lst = [torch.empty_like(shifted_row_input) for _ in range(WP)]
+    dist.all_gather(out_lst, shifted_row_input, group=wp_group)
+    gathered_shifted_input = torch.cat(out_lst, dim=nrow_dim)
     print_rank0(f'shifted_input[0, :, :, 0, 0]:\n'
-                f'{shifted_input[0, :, :, 0, 0]}\n')
+                f'{shifted_input[0, :, :, 0, 0].int()}\n')
     print_rank0(f'gathered_shifted_input[0, :, :, 0, 0]:\n'
-                f'{gathered_shifted_input[0, :, :, 0, 0]}\n')
-    assert torch.allclose(gathered_shifted_input, shifted_input),\
+                f'{gathered_shifted_input[0, :, :, 0, 0].int()}\n')
+    assert torch.allclose(gathered_shifted_input, shifted_input), \
         'unit-test for shift mechanism failed'
 
-    ## TODO: Do attention per window
+    ## TODO: Do attention per window -> (B, hc, s, hs)
+    from functools import partial
+    reshape_for_FA = partial(rearrange, 
+        pattern='B (n_row w1) (n_col w2) hc hs -> (B n_row n_col) (w1 w2) hc hs',
+        w1 = win_h,
+        w2 = win_w
+    )
+    reshaped_row_input = reshape_for_FA(shifted_row_input)  
+    reshaped_input = reshape_for_FA(shifted_input)  # (B, hc, s, hs)
+    wp_out = F.scaled_dot_product_attention(*[reshaped_row_input for _ in range(3)])
+    out = F.scaled_dot_product_attention(*[reshaped_input for _ in range(3)])
+    wp_out_lst = [torch.empty_like(wp_out) for _ in range(WP)]
+    dist.all_gather(wp_out_lst, wp_out, group=wp_group)
+    seq_dim = 2
+    full_wp_out = torch.cat(wp_out_lst, dim=seq_dim)
+
+    # raise KeyboardInterrupt()
+    print(f"full_wp_out.shape: {full_wp_out.shape}")
+    print(f"out.shape: {out.shape}")
+    assert torch.allclose(full_wp_out, out),\
+        'FA forward of window parallelism is incorrect'
+
     # import torch.nn.functional as F
     # F.scaled_dot_product_attention()  # B, hc, s, hs
 
@@ -229,6 +260,7 @@ def test_internode_window_parallel_shift():
     # print(f"copy_input.shape: {copy_input.shape}")
 
 if __name__ == "__main__":
-    # test_intranode_window_parallel_shift()
-    test_internode_window_parallel_shift()
+    torch.set_default_dtype(torch.float32)
+    test_intranode_window_parallel_shift()
+    # test_internode_window_parallel_shift()
     # test_ulysses()
