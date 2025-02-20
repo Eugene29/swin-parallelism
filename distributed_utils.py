@@ -1,20 +1,12 @@
 import torch
 import torch.distributed as dist
 
-# class DistributedUtils():
 def get_backend():
     if torch.cuda.is_available():
         return 'nccl'
     if torch.xpu.is_available():
         return 'ccl'
     return 'gloo'
-
-# def initialize_distributed_backend():
-    # dist.init_process_group(backend=get_backend())
-    # RANK = dist.get_rank()
-    # WORLD_SIZE = dist.get_world_size()
-    # print_in_order(f"RANK: {RANK}")
-    # print_rank0(f"WORLD_SIZE: {WORLD_SIZE}")
 
 
 def print_in_order(msg):
@@ -30,7 +22,7 @@ def print_rank0(msg):
     if dist.is_initialized():
         RANK = dist.get_rank()
         if RANK == 0:
-            print(f"{RANK}: {msg}")
+            print(f"{RANK}: {msg}", flush=True)
     else:
         print(msg)
 
@@ -41,3 +33,10 @@ def get_device_type():
     if torch.xpu.is_available():
         return 'xpu'
     return 'cpu'
+
+def get_device_count():
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_count()
+    if torch.xpu.is_available():
+        return torch.xpu.get_device_count()
+    return dist.get_world_size()

@@ -3,6 +3,7 @@ import torch.distributed as dist
 from torch import Tensor
 from typing import Any, Tuple
 
+
 def post_all2all(scatter_idx, batch_dim_idx, seq_world_size, bs, seq_len, num_head, head_dim):
 
     def post_func(input):
