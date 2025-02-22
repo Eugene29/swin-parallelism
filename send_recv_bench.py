@@ -21,47 +21,64 @@ def benchmark_send_recv(
 
     loc_world_size = get_device_count()
     ## send-recv 
-    # Assuming single-ring is only used for intra-node. Any cleaner way to do 
+    # 1. Run first half then second half to avoid deadlock (cyclical?)
+    # 2. Assuming single-ring is only used for intra-node. Any cleaner way to do 
     # handle? 
-    # Run first half then second half to avoid deadlock (cyclical?)
     if loc_world_size == world_size:  # (single-ring)
         first_send_ranks = range(world_size // 2)
         first_recv_ranks = range(1, world_size//2 + 1, 1)
-        if rank in first_send_ranks:
-            send_req = dist.send(msg, dst)
-        if rank in first_recv_ranks:
-            recv_req = dist.recv(out, src)
-
-        if rank not in first_send_ranks:
-            send_req = dist.send(msg, dst)
-        if rank not in first_recv_ranks:
-            recv_req = dist.recv(out, src)
     else:  # (inter-node)
         first_recv_ranks = range(world_size//2)
         first_send_ranks = range(loc_world_size, world_size//2 + loc_world_size)
 
-    synchronize()
-    strt = time.perf_counter_ns()
+        # ## Nic-aware and dead-lock proof send-recv
+        # # Get first send/recv ranks
+        # # Group ranks in to four quadrants to first perform send/recvs quadrant 
+        # # 1, 3 and then 2, 4 second. 
+        # first_send_ranks = []
+        # first_recv_ranks = []
+        # half_loc_ws = loc_world_size // 2
+        # loc_first_half_ranks = range(0, half_loc_ws)
+        # for global_rank in range(world_size):
+        #     local_rank = global_rank % loc_world_size
+        #     in_left_half = local_rank in loc_first_half_ranks 
+        #     in_top_half = global_rank < world_size//2
+        #     in_first_quad = in_left_half and in_top_half
+        #     in_fourth_quad = not (in_left_half or in_top_half)
+        #     if in_first_quad or in_fourth_quad:
+        #         first_recv_rank = (global_rank+loc_world_size) % world_size
+        #         first_send_ranks.append(global_rank)
+        #         first_recv_ranks.append(first_recv_rank)
 
+    # print_rank0(f"first_recv_ranks: {first_recv_ranks}", flush=True)
+    # print_rank0(f"first_send_ranks: {first_send_ranks}", flush=True)
+    # raise KeyboardInterrupt()
+
+    dist.barrier()
+    strt = record_event()
+    # strt = time.perf_counter_ns()
+
+    # first batch send/recv
     if rank in first_send_ranks:
         send_req = dist.send(msg, dst)
     if rank in first_recv_ranks:
         recv_req = dist.recv(out, src)
+    # second batch send/recv
     if rank not in first_send_ranks:
         send_req = dist.send(msg, dst)
     if rank not in first_recv_ranks:
         recv_req = dist.recv(out, src)
-
-    synchronize()
-    end = time.perf_counter_ns()
+    end = record_event()
+    # end = time.perf_counter_ns()
 
     # ## Sanity check
     # print_in_order(f"msg: {msg}", flush=True)
     # print_in_order(f"out: {out}", flush=True)
 
     ## Calculate minimum bandwidth (gpbs)
-    nano_seconds_taken = end - strt
-    bandwidth_per_rank_gbps = 16 * msg_size / nano_seconds_taken  # n
+    synchronize()
+    time_taken_sec = calc_time(strt, end)
+    bandwidth_per_rank_gbps = 16 * msg_size / time_taken_sec / 1e9  # giga = 1e9
     min_bandwidth = torch.tensor(bandwidth_per_rank_gbps, dtype=torch.float)
     max_bandwidth = torch.tensor(bandwidth_per_rank_gbps, dtype=torch.float)
 
@@ -149,8 +166,8 @@ if __name__ == "__main__":
     # os.makedirs(os.path.dirname(plot_pth), exist_ok=True)
     # plt.plot(lst_logged_size, lst_min_bandwidth, label='min')
     # plt.plot(lst_logged_size, lst_max_bandwidth, label='max')
-    # plt.bar(lst_logged_size, lst_min_bandwidth, label='min')
-    # plt.bar(lst_logged_size, lst_max_bandwidth, label='max')
+    # # plt.bar(lst_logged_size, lst_min_bandwidth, label='min')
+    # # plt.bar(lst_logged_size, lst_max_bandwidth, label='max')
     # plt.xlabel('message size (log10)')
     # plt.ylabel('bandwidth per rank (gpbs)')
     # plt.title('(Polaris) inter-node ping bandwidth for cyclical send/recv (2 nodes)')
@@ -158,4 +175,4 @@ if __name__ == "__main__":
     # plt.savefig(plot_pth)
 
 ## FIXME: there is a divergence issue when I test more than 1 send/recv at a time, but doesn't occur when I benchmark only one send/recv at a time. 
-## TODO:  Try first half, the other half simultaenously such that it resolves the nic imbalance issue. 
+## Tried only using half num NIC simultaenously such that it resolves the nic imbalance issue, but it doesn't show significant improvement? 

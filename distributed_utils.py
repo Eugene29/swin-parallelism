@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+import time
 
 def get_backend():
     if torch.cuda.is_available():
@@ -51,14 +52,24 @@ def synchronize():
         return torch.xpu.synchronize()
     
 
-# def create_and_record_event():
-#     ## FIXaME: check if perf_counter_ns have the same metric as Event.record()
-#     if torch.cuda.is_available():
-#         event = torch.cuda.Event(enable_timing=True)
-#         return event
-#     elif torch.xpu.is_available():
-#         event = torch.xpu.Event(enable_timing=True)
-#     else:
-#         return time.perf_counter_ns()
-#     event.record()
-#     return event
+def record_event():
+    ## FIXaME: check if perf_counter_ns have the same metric as Event.record()
+    if torch.cuda.is_available():
+        event = torch.cuda.Event(enable_timing=True)
+    elif torch.xpu.is_available(): 
+        # TODO: how to use updated torch version with xpu? 
+        event = torch.xpu.Event(enable_timing=True)
+    else:
+        return time.perf_counter_ns()
+    event.record()
+
+    return event
+
+
+def calc_time(strt, end):
+    if isinstance(strt, int):  
+        # assuming int => time.perf_counter_ns is used
+        return (end - strt) / 1e9  # 1 sec = 1e9 ns
+    else:  # accelerator event in ms
+        return strt.elapsed_time(end) / 1e3
+    
