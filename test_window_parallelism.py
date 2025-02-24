@@ -10,6 +10,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from einops import rearrange
+from functools import partial
+
 
 
 ## TODO: follow the best practice and make the unit-test more modular
@@ -36,7 +38,7 @@ def setup_window_parallelism(
     sp_group = device_mesh.get_group('SP')
     wp_group = device_mesh.get_group('WP')
     dp_group = device_mesh.get_group('DP')
-    comm_groups = (sp_group, wp_group, dp_group)
+    comm_groups = (dp_group, wp_group, sp_group, )
     wp_rank = dist.get_rank(wp_group)
     sp_rank = dist.get_rank(sp_group)
     dp_rank = dist.get_rank(sp_group)
@@ -131,7 +133,7 @@ def test_intranode_window_parallel_shift():
     # row_partitioned_input: (B, n_row_patches/wp, n_col_patches, hc, hs)
     input, row_partitioned_input, patch_grid_size, window_size, comm_groups = \
         setup_window_parallelism(window_parallelism_degree=world_size)
-    sp_group, wp_group, dp_group = comm_groups
+    dp_group, wp_group, sp_group = comm_groups
     win_h, win_w = window_size
     shift_size = win_h//2, win_w//2
     WP = dist.get_world_size(wp_group)
@@ -163,7 +165,6 @@ def test_intranode_window_parallel_shift():
         'unit-test for shift mechanism failed'
 
     ## TODO: Do attention per window -> (B, hc, s, hs)
-    from functools import partial
     reshape_for_FA = partial(
         rearrange, 
         pattern='B (n_row w1) (n_col w2) hc hs -> B (n_row n_col) hc (w1 w2) hs',
@@ -267,7 +268,7 @@ def test_internode_window_parallel_shift():
     # seq_sharded_x: (B, s/sp, hc, hs) with s = n_row_patches * n_col_patches / wp
     input, seq_sharded_x, patch_grid_size, shift_size, comm_groups = \
         setup_window_parallelism(ulysses_degree=12, window_parallelism_degree=2)
-    sp_group, wp_group, dp_group = comm_groups
+    dp_group, wp_group, sp_group = comm_groups
     B, loc_s, hc, hs = seq_sharded_x.shape
     WP = dist.get_world_size(wp_group)
     SP = dist.get_world_size(sp_group)

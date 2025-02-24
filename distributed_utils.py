@@ -1,3 +1,5 @@
+"""Boilerplate code for device agnostic torch"""
+
 import torch
 import torch.distributed as dist
 import time
@@ -32,7 +34,7 @@ def print_in_order(msg, **kwargs):
     WORLD_SIZE = dist.get_world_size()
     for i in range(WORLD_SIZE):
         if RANK == i:
-            print(f"{RANK}: {msg}")
+            print(f"{RANK}: {msg}", flush=True)
         dist.barrier()
 
 

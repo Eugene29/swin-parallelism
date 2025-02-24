@@ -18,22 +18,18 @@ class _WindowParallelism(torch.autograd.Function):
         '''
         ctx.shift_size = shift_size
         ctx.wp_group = wp_group
-        wp_rank = dist.get_rank(ctx.wp_group)  # FIXME: Verify that this returns the group rank?
+        wp_rank = dist.get_rank(ctx.wp_group)
         wp_world_size = dist.get_world_size(ctx.wp_group)
-
-        ## Prepare row_partitioned_input for a send/recv 
-        # -> [B, n_row_patches/wp/2, n_col_patches, hc, hs)] x2
         horizontal_shift_size, vertical_shift_size = shift_size
 
-
-        if vertical_shift_size < 0:  # negative means upward
+        if vertical_shift_size < 0:  # send upward
             send_slice = slice(0, vertical_shift_size)  # send top row portion
             remain_slice = slice(vertical_shift_size, None)  # store lower row portion
-            dst = wp_rank-1 if wp_rank != 0 else wp_world_size-1  # send to previous rank
+            dst = wp_rank-1 if wp_rank != 0 else wp_world_size-1  # send to prev rank
             src = wp_rank+1 if wp_rank != wp_world_size-1 else 0
-        else:
-            remain_slice = slice(0, vertical_shift_size)  # store top row portion
+        else:  # send downwards
             send_slice = slice(vertical_shift_size, None)  # send lower row portion
+            remain_slice = slice(0, vertical_shift_size)  # store top row portion
             dst = wp_rank+1 if wp_rank != wp_world_size-1 else 0  # send to next rank
             src = wp_rank-1 if wp_rank != 0 else wp_world_size-1  
 
@@ -44,8 +40,6 @@ class _WindowParallelism(torch.autograd.Function):
         global_dst = dist.get_global_rank(ctx.wp_group, dst)
         global_src = dist.get_global_rank(ctx.wp_group, src)
         recv_row_input = torch.empty_like(send_row_input)
-        # HACK: if vertical shift is neg -> flip the send recv op
-        # TODO: Find a more interpretable implementation?
         send_req = dist.isend(send_row_input, global_dst)
         recv_req = dist.irecv(recv_row_input, global_src)
         send_req.wait()
