@@ -26,7 +26,9 @@ def get_device_count():
     elif torch.xpu.is_available():
         return torch.xpu.device_count()
     else:
-        raise KeyboardInterrupt()
+        print_rank0("WARNING: For test purposes, setting local world_size to 12")
+        return 12
+        # raise KeyboardInterrupt()
     
 
 def print_in_order(msg, **kwargs):

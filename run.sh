@@ -12,24 +12,26 @@
 #PBS -e /flare/Aurora_deployment/eku/swin-parallelism/e/
 
 
-# WORK_DIR=$(dirname ${BASH_SOURCE[0]} | xargs realpath)
-WORK_DIR="/flare/Aurora_deployment/eku/swin-parallelism"
-NNODES=$(wc -l < $PBS_NODEFILE)
-NRANKS_PER_NODE=12
-NRANKS=$((NNODES * NRANKS_PER_NODE))
-cd $WORK_DIR
-
 ## MPIEXEC
-export MASTER_ADDR=$(hostname)
-export MASTER_PORT=$RANDOM
-export CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0
-mpiexec -n ${NRANKS} -ppn ${NRANKS_PER_NODE} \
-    python "${WORK_DIR}/test_window_parallelism.py"
-    # python "${WORK_DIR}/send_recv_bench.py"
+# WORK_DIR=$(dirname ${BASH_SOURCE[0]} | xargs realpath)
+# WORK_DIR="/flare/Aurora_deployment/eku/swin-parallelism"
+# NNODES=$(wc -l < $PBS_NODEFILE)
+# NRANKS_PER_NODE=12
+# NRANKS=$((NNODES * NRANKS_PER_NODE))
+# cd $WORK_DIR
+
+# export MASTER_ADDR=$(hostname)
+# export MASTER_PORT=$RANDOM
+# export CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0
+# mpiexec -n ${NRANKS} -ppn ${NRANKS_PER_NODE} \
+#     python "${WORK_DIR}/test_window_parallelism.py"
 
 # mpiexec -n ${NRANKS} -ppn ${NRANKS_PER_NODE} \
 #     python "${WORK_DIR}/vaino_pingpong.py"
+    # python "${WORK_DIR}/send_recv_bench.py"
 
-# TORCHRUN
-# torchrun --nproc-per-node $NRANKS_PER_NODE "$WORK_DIR\test_window_parallelism.py"
+
+## TORCHRUN
+PYTHON_FILE="/c/Users/eugen/Codes/swin_parallelism/test_window_parallelism.py"
+torchrun --nproc-per-node 12 ${PYTHON_FILE}
 # torchrun --nproc-per-node $NRANKS_PER_NODE "$WORK_DIR\send_recv_bench.py"

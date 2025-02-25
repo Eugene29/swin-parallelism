@@ -7,53 +7,54 @@ class _WindowParallelism(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        row_partitioned_input: Tensor, 
+        input_shard: Tensor, 
         shift_size: list[int],
         wp_group: dist.ProcessGroup
     ) -> Tensor:
         r'''Shift the windows of SWIN transfromer in a distributd setting
         
-            Args:
-                row_partitioned_input: (B, n_row_patches/wp, n_col_patches, hc, hs)
+        Args:
+            input_shard: (B, n_row_patches/wp, n_col_patches, hc or hc/sp, hs)
         '''
         ctx.shift_size = shift_size
         ctx.wp_group = wp_group
         wp_rank = dist.get_rank(ctx.wp_group)
         wp_world_size = dist.get_world_size(ctx.wp_group)
-        horizontal_shift_size, vertical_shift_size = shift_size
+        shift_h, shift_w = shift_size
 
-        if vertical_shift_size < 0:  # send upward
-            send_slice = slice(0, vertical_shift_size)  # send top row portion
-            remain_slice = slice(vertical_shift_size, None)  # store lower row portion
+        if shift_h < 0:  # send upward
+            slice_send = slice(0, shift_h)  # send top row portion
+            slice_store = slice(shift_h, None)  # store lower row portion
             dst = wp_rank-1 if wp_rank != 0 else wp_world_size-1  # send to prev rank
             src = wp_rank+1 if wp_rank != wp_world_size-1 else 0
         else:  # send downwards
-            send_slice = slice(vertical_shift_size, None)  # send lower row portion
-            remain_slice = slice(0, vertical_shift_size)  # store top row portion
+            slice_send = slice(shift_h, None)  # send lower row portion
+            slice_store = slice(0, shift_h)  # store top row portion
             dst = wp_rank+1 if wp_rank != wp_world_size-1 else 0  # send to next rank
             src = wp_rank-1 if wp_rank != 0 else wp_world_size-1  
 
-        send_row_input = row_partitioned_input[:, send_slice, :, :, :].contiguous()
-        remain_row_input = row_partitioned_input[:, remain_slice, :, :, :].contiguous()
+        row_send = input_shard[:, slice_send, :, :, :].contiguous()
+        row_store = input_shard[:, slice_store, :, :, :].contiguous()
         ## Shift with send-recv ("single ring")
-        ## FIXME: Probably need to handle hangs by sending it in 2 rounds. 
+        ## FIXME: Probably need to handle hangs by sending it in 2 rounds.
+        ## TODO: add individual group trick for faster send/recv
         global_dst = dist.get_global_rank(ctx.wp_group, dst)
         global_src = dist.get_global_rank(ctx.wp_group, src)
-        recv_row_input = torch.empty_like(send_row_input)
-        send_req = dist.isend(send_row_input, global_dst)
-        recv_req = dist.irecv(recv_row_input, global_src)
+        row_recv = torch.empty_like(row_send)
+        send_req = dist.isend(row_send, global_dst)
+        recv_req = dist.irecv(row_recv, global_src)
         send_req.wait()
         recv_req.wait()
 
         ## Reshape -> [B, n_row_patches/wp, n_col_patches, hc, hs)]
         # vertically concatenate remaining bottom row on top of recv'd row
-        if vertical_shift_size < 0:
-            concat_row_input = torch.cat([remain_row_input, recv_row_input], dim=1)
+        if shift_h < 0:
+            concat_row_input = torch.cat([row_store, row_recv], dim=1)
         else:
-            concat_row_input = torch.cat([recv_row_input, remain_row_input], dim=1)
+            concat_row_input = torch.cat([row_recv, row_store], dim=1)
 
-        left_slice = slice(-horizontal_shift_size, None)
-        right_slice = slice(0, -horizontal_shift_size)
+        left_slice = slice(-shift_w, None)
+        right_slice = slice(0, -shift_w)
         # shift to the left by shift size
         shifted_row_input = torch.cat([
             concat_row_input[:, :, left_slice, :, : ],
@@ -76,8 +77,8 @@ class _WindowParallelism(torch.autograd.Function):
 
 
 def window_parallel_shift(
-    row_partitioned_input: Tensor, 
+    input_shard: Tensor, 
     shift_size: list[int],
     wp_group: dist.ProcessGroup = None,
 ) -> Tensor:
-    return _WindowParallelism.apply(row_partitioned_input, shift_size, wp_group)
+    return _WindowParallelism.apply(input_shard, shift_size, wp_group)
