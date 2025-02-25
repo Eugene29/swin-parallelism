@@ -1,5 +1,6 @@
 # TODO: get this import to work inside test/
 # TODO: Change it to explicit imports
+# from mpi4py import MPI
 from distributed_utils import *
 from window_parallelism import window_parallel_shift
 from ulysses import _SeqAllToAll
@@ -8,6 +9,9 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
+if torch.xpu.is_available():
+    import intel_extension_for_pytorch
+    import oneccl_bindings_for_pytorch
 from einops import rearrange
 from functools import partial
 
@@ -18,7 +22,8 @@ from collections import namedtuple
 
 
 def log_tensor_slice(tensor_name, tensor):
-    """log a tensor slice on rank 0
+    """Log a slice of tensor on rank 0
+
     Args:
         tensor: [B, nrow_patch, ncol_patch, hc, hs]
     """
@@ -26,29 +31,47 @@ def log_tensor_slice(tensor_name, tensor):
         logging.info(f"{tensor_name}:\n{tensor[0, :, :, 0, 0].long()}\n\n")
 
 
-def setup(
-    ulysses_degree=1, 
-    window_parallelism_degree=1, 
-):
-    r'''Initialize comm groups. Create and return both row sharded and head count sharded 
+def setup(ulysses_degree=1, window_parallelism_degree=1):
+    r"""Initialize comm groups. Create and return both row sharded and head count sharded 
     toy data.
     
     Returns:
         input_shard: B, n_patch_row/wp, n_patch_col, hc/sp, hs
-    '''
+    """
+
     ## Initialize 3D Device Mesh
-    dist.init_process_group(backend=get_backend())  # Torchrun
-    world_size = dist.get_world_size()
+    if 'RANK' in os.environ:  # Torchrun
+        dist.init_process_group(backend=get_backend())  
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    else:  # Mpiexec
+        rank = MPI.COMM_WORLD.Get_rank()
+        world_size = MPI.COMM_WORLD.Get_size()
+        dist.init_process_group(
+            backend=get_backend(), rank=rank, world_size=world_size
+        )
     SP, WP = (ulysses_degree, window_parallelism_degree)
     DP = world_size // SP // WP
     assert world_size == (DP*SP*WP), 'Your parallel degrees are likely wrong'
     device_mesh = init_device_mesh(device_type=get_device_type(), 
                                    mesh_shape=[DP, WP, SP],
                                    mesh_dim_names=['DP','WP','SP'])
-    sp_group = device_mesh.get_group('SP')
     wp_group = device_mesh.get_group('WP')
+    sp_group = device_mesh.get_group('SP')
     wp_rank = dist.get_rank(wp_group)
     sp_rank = dist.get_rank(sp_group)
+    dist.all_reduce(torch.randn(100), group=wp_group)  # Init for send/recv
+    # if wp_rank == 0:
+    #     print(f"wp_group: {dist.get_process_group_ranks(wp_group)}")
+    # if sp_rank == 0:
+    #     print(f"sp_group: {dist.get_process_group_ranks(sp_group)}")
+
+    # if rank == 0:
+    #     print(f"wp_group: {dist.get_process_group_ranks(wp_group)}")
+    #     dist.send(torch.randn(100), 2, group=wp_group)
+    # elif rank == 2:
+    #     dist.recv(torch.randn(100), 0, group=wp_group)
+    # raise KeyboardInterrupt()
 
     ## Set Image Dimensions
     B, hc, hs = (2, SP, 2)
@@ -63,17 +86,18 @@ def setup(
     )()
 
     ## Create Toy Image -> B, n_patch_row, n_patch_col, hc, hs
+    # torch.set_default_device(rank % get_device_count())  # FIXME: uncomment for gpu
     dtype = torch.get_default_dtype()
     input = torch.arange(np.prod(input_dim), dtype=dtype).view(input_dim)  
 
-    ## Shard Image
-    # Shard input by row -> B, n_patch_row/wp, n_patch_col, hc, hs
+    ## WP Sharding (shard by row) -> B, n_patch_row/wp, n_patch_col, hc, hs
     assert nrow % WP == 0, 'num row windows must be divisible by WP'
     row_chunk = nrow // WP * win_h  # num row patches per WP
     row_slice = slice(row_chunk*wp_rank, row_chunk*(wp_rank+1))
     input_row_shard = input[:, row_slice, :, :, :]
-    # Shard input by head count -> B, n_patch_row/wp, n_patch_col, hc/sp, hs
-    assert (row_chunk*ncol_patch) % SP == 0, 'uneven head ulysses is not supported'
+
+    ## SP Sharding (shard by head count) -> B, n_patch_row/wp, n_patch_col, hc/sp, hs
+    assert (row_chunk*ncol_patch) % SP == 0, 'uneven sequence ulysses is not supported'
     assert hc % SP == 0, 'uneven head ulysses is not supported'
     hc_chunk = hc // SP  # num head count per SP(ulysses)
     hc_slice = slice(hc_chunk*sp_rank, hc_chunk*(sp_rank+1))
@@ -81,7 +105,7 @@ def setup(
 
     log_tensor_slice('input', input)
     log_tensor_slice('input_row_shard', input_row_shard)
-    log_tensor_slice('input_shard', input_shard)
+    log_tensor_slice('input_shard (row, hc sharded)', input_shard)
 
     return input, input_shard, device_mesh, args
 
@@ -118,7 +142,7 @@ def test_window_parallel_shift(input, input_shard, device_mesh, args):
     log_tensor_slice('shifted', shifted)
     log_tensor_slice('gathered_shifted', gathered_shifted)
     assert torch.allclose(shifted, gathered_shifted)
-    print_rank0("passed 'test_window_parallel_shift'")
+    print_rank0("passed test_window_parallel_shift")
 
 
 def test_window_parallel_shift_and_rev_shift(input, input_shard, device_mesh, args):
@@ -170,9 +194,11 @@ def fwd_bwd_3D(input, input_shard, device_mesh, args):
         input_shard: B, n_patch_row/wp, n_patch_col, hc/sp, hs
     """
 
-    ## fwd go brr
-    # shift shift!!
-    pass
+    input.requires_grad_()  # in place operation to set requires_grad = True
+    input_shard.requires_grad_()
+
+    ## Normal FWD
+    ...
 
 
 if __name__ == "__main__":
@@ -182,17 +208,8 @@ if __name__ == "__main__":
 
     # setup parallel settings for ulysses, WP
     input, input_shard, device_mesh, args = \
-        setup(ulysses_degree=4, window_parallelism_degree=3)
+        setup(ulysses_degree=2, window_parallelism_degree=2)
     
     test_window_parallel_shift(input, input_shard, device_mesh, args)
     test_window_parallel_shift_and_rev_shift(input, input_shard, device_mesh, args)
     test_ulysses(input, input_shard, device_mesh, args)
-
-
-    ## TODO: How to get the tests to all run at once? 
-    # test_intranode_WP_shift()
-    # test_WP_shift_and_rev_shift()
-
-    # test_intranode_window_parallel_fwd()
-    # test_internode_window_parallel_shift()
-    # test_ulysses()
