@@ -31,7 +31,6 @@ class _WindowParallelism(torch.autograd.Function):
         wp_next_rank = wp_rank+1 if wp_rank != wp_world_size-1 else 0
         wp_prev_rank = wp_rank-1 if wp_rank != 0 else wp_world_size-1
 
-
         ## Vertical Shift: send/recv based on shift_size
         if shift_h < 0:  # shift up
             send_shard, remain_shard = (top_shard, bot_shard)
@@ -79,9 +78,9 @@ class _WindowParallelism(torch.autograd.Function):
         ctx,
         output_grads: Tensor, 
     ) -> Tuple[None, Tensor, None, None]:
-        reverse_shift_size = (-ctx.shift_size[0], -ctx.shift_size[1])
+        rev_shift_size = (-ctx.shift_size[0], -ctx.shift_size[1])
         return (
-            _WindowParallelism.apply(output_grads, reverse_shift_size, ctx.wp_group), 
+            _WindowParallelism.apply(output_grads, rev_shift_size, ctx.wp_group), 
             None, 
             None
         )

@@ -58,8 +58,10 @@ def setup(ulysses_degree=1, window_parallelism_degree=1):
                                    mesh_dim_names=['DP','WP','SP'])
     wp_group = device_mesh.get_group('WP')
     sp_group = device_mesh.get_group('SP')
+    dp_group = device_mesh.get_group('DP')
     wp_rank = dist.get_rank(wp_group)
     sp_rank = dist.get_rank(sp_group)
+    dp_rank = dist.get_rank(dp_group)
     dist.all_reduce(torch.randn(100), group=wp_group)  # Init for send/recv
     # if wp_rank == 0:
     #     print(f"wp_group: {dist.get_process_group_ranks(wp_group)}")
@@ -74,7 +76,7 @@ def setup(ulysses_degree=1, window_parallelism_degree=1):
     # raise KeyboardInterrupt()
 
     ## Set Image Dimensions
-    B, hc, hs = (2, SP, 2)
+    B, hc, hs = (DP, SP, 2)
     nrow, ncol = (2*WP, 2*WP)  # grid size of windows
     win_h, win_w = (2, 3)  # window size
     shift_h, shift_w = (2, 1)
@@ -101,14 +103,43 @@ def setup(ulysses_degree=1, window_parallelism_degree=1):
     assert hc % SP == 0, 'uneven head ulysses is not supported'
     hc_chunk = hc // SP  # num head count per SP(ulysses)
     hc_slice = slice(hc_chunk*sp_rank, hc_chunk*(sp_rank+1))
-    input_shard = input_row_shard[:, :, :, hc_slice, :]
+    input_hc_shard = input_row_shard[:, :, :, hc_slice, :]
+
+    ## DP Sharding (shard by batch) -> B/DP, n_patch_row/wp, n_patch_col, hc/sp, hs
+    assert B % DP == 0, 'Batch size indivisible by DP'
+    dp_chunk = B // DP  # num head count per SP(ulysses)
+    dp_slice = slice(dp_chunk*dp_rank, dp_chunk*(dp_rank+1))
+    input_shard = input_hc_shard[dp_slice, :, :, :, :]
 
     log_tensor_slice('input', input)
-    log_tensor_slice('input_row_shard', input_row_shard)
-    log_tensor_slice('input_shard (row, hc sharded)', input_shard)
+    log_tensor_slice('input_shard', input_row_shard)
 
     return input, input_shard, device_mesh, args
 
+
+def gather_3D_shard(input_shard, device_mesh, dp_dim=0, wp_dim=1, sp_dim=3):
+    wp_group = device_mesh['WP'].get_group()
+    sp_group = device_mesh['SP'].get_group()
+    dp_group = device_mesh['DP'].get_group()
+    WP = dist.get_world_size(wp_group)
+    SP = dist.get_world_size(sp_group)
+    DP = dist.get_world_size(dp_group)
+
+    # gather along WP
+    lst_wp_shard = [torch.empty_like(input_shard) for _ in range(WP)]
+    dist.all_gather(lst_wp_shard, input_shard, group=wp_group)
+    hc_shard = torch.cat(lst_wp_shard, dim=wp_dim)  # concat row dim
+    # gather along SP
+    lst_hc_shard = [torch.empty_like(hc_shard) for _ in range(SP)]
+    dist.all_gather(lst_hc_shard, hc_shard, group=sp_group)
+    dp_shard = torch.cat(lst_hc_shard, dim=sp_dim)  # concat hc dim
+    # gather along DP
+    lst_dp_shard = [torch.empty_like(dp_shard) for _ in range(DP)]
+    dist.all_gather(lst_dp_shard, dp_shard, group=dp_group)
+    gathered_shifted = torch.cat(lst_dp_shard, dim=dp_dim)  # concat batch dim
+
+    return gathered_shifted
+    
 
 def test_window_parallel_shift(input, input_shard, device_mesh, args):
     """Test window parallel shift against normal shift (roll)
@@ -119,9 +150,6 @@ def test_window_parallel_shift(input, input_shard, device_mesh, args):
 
     neg_shift_size = (-args.shift_h, -args.shift_w)
     wp_group = device_mesh['WP'].get_group()
-    sp_group = device_mesh['SP'].get_group()
-    WP = dist.get_world_size(wp_group)
-    SP = dist.get_world_size(sp_group)
 
     # Normal shift (roll)
     shifted = torch.roll(input, neg_shift_size, dims=(1,2))  # dim: nrow, ncol
@@ -130,18 +158,12 @@ def test_window_parallel_shift(input, input_shard, device_mesh, args):
     wp_shifted = window_parallel_shift(input_shard, neg_shift_size, wp_group=wp_group)
 
     ## Compare (by gathering parallel input)
-    # gather along WP
-    lst_wp_shard = [torch.empty_like(wp_shifted) for _ in range(WP)]
-    dist.all_gather(lst_wp_shard, wp_shifted, group=wp_group)
-    hc_shard = torch.cat(lst_wp_shard, dim=1)  # concat row dim
-    # gather along SP
-    lst_hc_shard = [torch.empty_like(hc_shard) for _ in range(SP)]
-    dist.all_gather(lst_hc_shard, hc_shard, group=sp_group)
-    gathered_shifted = torch.cat(lst_hc_shard, dim=3)  # concat hc dim
-
+    # DP_dim=0, WP_dim=1, HC_dim=3
+    gathered_shifted = gather_3D_shard(wp_shifted, device_mesh, 0, 1, 3)
     log_tensor_slice('shifted', shifted)
     log_tensor_slice('gathered_shifted', gathered_shifted)
     assert torch.allclose(shifted, gathered_shifted)
+
     print_rank0("passed test_window_parallel_shift")
 
 
@@ -185,31 +207,165 @@ def test_ulysses(input, input_shard, device_mesh, args):
     print_rank0("passed test_ulysses")
 
 
-def fwd_bwd_3D(input, input_shard, device_mesh, args):
-    """Roughly simulate the workload of SWIN transformer and check the functionality of 
-    fwd+bwd
-    
-    Args:
-        input: B, n_patch_row, n_patch_col, hc, hs
-        input_shard: B, n_patch_row/wp, n_patch_col, hc/sp, hs
-    """
-
+def test_WP_bwd(input, input_shard, device_mesh, args):
+    neg_shift_size = (-args.shift_h, -args.shift_w)
+    dp_group = device_mesh['DP'].get_group()
+    wp_group = device_mesh['WP'].get_group()
+    sp_group = device_mesh['SP'].get_group()
+    dp_rank = dist.get_rank(dp_group)
+    wp_rank = dist.get_rank(wp_group)
+    sp_rank = dist.get_rank(sp_group)
     input.requires_grad_()  # in place operation to set requires_grad = True
     input_shard.requires_grad_()
+    dp_B, wp_nrow, ncol, sp_hc, hs = input_shard.shape
 
-    ## Normal FWD
-    ...
+    # Normal shift (roll)
+    shifted = torch.roll(input, neg_shift_size, dims=(1,2))  # dim: nrow, ncol
+
+    # Window Parallel Shift
+    wp_shifted = window_parallel_shift(input_shard, neg_shift_size, wp_group=wp_group)
+
+    ## Random Compute
+    matrix = torch.randn_like(shifted).transpose(-1, -2)
+    slice_row = slice(wp_nrow*wp_rank, wp_nrow*(wp_rank+1))
+    slice_hc = slice(sp_hc*sp_rank, sp_hc*(sp_rank+1))
+    slice_dp = slice(dp_B*dp_rank, dp_B*(dp_rank+1))
+    wp_matrix = matrix[slice_dp, slice_row, :, slice_hc, :]
+    out = shifted * matrix
+    wp_out = wp_shifted * wp_matrix
+    gathered_out = gather_3D_shard(wp_out, device_mesh) 
+    assert torch.allclose(out, gathered_out)
+
+    ## Loss
+    label = torch.randn_like(out)
+    wp_label = label[slice_dp, slice_row, :, slice_hc, :]
+    loss = F.mse_loss(label, out)
+    wp_loss = F.mse_loss(wp_label, wp_out)
+    wp_loss_tmp = wp_loss.detach().clone()
+    dist.all_reduce(wp_loss_tmp) 
+    wp_loss_avg = wp_loss_tmp / dist.get_world_size()
+    assert torch.allclose(loss, wp_loss_avg)
+
+    ## BWD
+    loss.backward()
+    wp_loss.backward()
+    gathered_grad = gather_3D_shard(input_shard.grad, device_mesh)
+    log_tensor_slice('input.grad', input.grad)
+    log_tensor_slice('gathered_grad', gathered_grad)
+    assert torch.allclose(input.grad, gathered_grad)
+
+    ## Compare (by gathering parallel input)
+    # DP_dim=0, WP_dim=1, HC_dim=3
+    # gathered_shifted = gather_3D_shard(wp_shifted, device_mesh, 0, 1, 3)
+
+# def test_WP_fwd_bwd(input, input_shard, device_mesh, args):
+#     from window_parallelism import _WindowParallelism
+#     pos_shift_size = (args.shift_h, args.shift_w)
+#     neg_shift_size = (-args.shift_h, -args.shift_w)
+#     wp_group = device_mesh['WP'].get_group()
+#     ctx = namedtuple('ctx', ['shift_size', 'wp_group', 'wp_group'])()
+#     fwd_out = _WindowParallelism().forward(ctx, input_shard, neg_shift_size, wp_group)
+#     bwd_out = _WindowParallelism().backward(ctx, fwd_out, pos_shift_size, wp_group)
+
+    # assert torch.allclose(fwd_out, bwd_out)
+
+# def test_3D_fwd_bwd(input, input_shard, device_mesh, args):
+#     """Roughly simulate the workload of SWIN transformer and check the functionality of 
+#     fwd+bwd
+    
+#     Args:
+#         input: B, n_patch_row, n_patch_col, hc, hs
+#         input_shard: B, n_patch_row/wp, n_patch_col, hc/sp, hs
+#     """
+
+#     shift_h, shift_w = args.shift_h, args.shift_w
+#     w_h, w_w = args.win_h, args.win_w
+#     input.requires_grad_()  # in place operation to set requires_grad = True
+#     input_shard.requires_grad_()
+#     wp_group = device_mesh['WP'].get_group()
+#     sp_group = device_mesh['SP'].get_group()
+#     dp_group = device_mesh['DP'].get_group()
+#     wp_rank = dist.get_rank(wp_group)
+#     sp_rank = dist.get_rank(sp_group)
+#     dp_rank = dist.get_rank(dp_group)
+#     rearrange_for_fa = partial(rearrange,
+#         pattern='B (n_win_r w1) (n_win_c w2) hc hs -> B (n_win_r n_win_c) hc (w1 w2) hs',
+#         w1=w_h,
+#         w2=w_w,
+#     )
+
+#     ## Normal FWD
+#     shifted = torch.roll(input, (-shift_h, -shift_w), dims=(1,2))  # dims: nrow, ncol
+#     rearranged = rearrange_for_fa(shifted)
+#     q, k, v = [rearranged*(c+1) for c in range(3)]  # arbitrary q, k, v
+#     out = F.scaled_dot_product_attention(q, k, v)
+
+#     ## 3D FWD
+#     scatter_idx = 1  # num patches dim
+#     gather_idx = 2  # head count dim
+#     batch_idx = 0
+#     dp_B, wp_nrow, ncol, sp_hc, hs = input_shard.shape
+#     flat_shard = input_shard.flatten(1, 2)  # -> B, N_p/wp, hc/sp, hs
+#     # first all2all sets up real workload where input's sequence is parallelized
+#     s_shard = _SeqAllToAll.apply(sp_group, flat_shard, scatter_idx, gather_idx, batch_idx)
+#     uly_out = _SeqAllToAll.apply(sp_group, s_shard, gather_idx, scatter_idx, batch_idx)
+#     wp_shard = rearrange(
+#         uly_out,
+#         'B (wp_nrow ncol) sp_hc hs -> B wp_nrow ncol sp_hc hs',
+#         wp_nrow=wp_nrow
+#     )
+#     wp_shifted = window_parallel_shift(wp_shard, (-shift_h, -shift_w), wp_group)
+#     wp_rearranged = rearrange_for_fa(wp_shifted)
+#     wp_q, wp_k, wp_v = [wp_rearranged*(c+1) for c in range(3)]  # arbitrary q, k, v
+#     wp_out = F.scaled_dot_product_attention(wp_q, wp_k, wp_v)
+#     gathered_out = gather_3D_shard(wp_out, device_mesh, dp_dim=0, wp_dim=1, sp_dim=2)
+#     assert torch.allclose(out, gathered_out)
+
+#     print_rank0('passed test_3D_fwd')
+
+#     ## LOSS
+#     log_tensor_slice('out', out)
+#     log_tensor_slice('wp_out', wp_out)
+#     log_tensor_slice('gathered_out', gathered_out)
+#     label = torch.randn_like(out)
+#     wp_nwin = wp_nrow * ncol // (w_h*w_w)
+
+#     slice_row =  slice(wp_nwin*wp_rank, wp_nwin*(wp_rank+1))
+#     slice_hc =  slice(sp_hc*sp_rank, sp_hc*(sp_rank+1))
+#     slice_dp =  slice(dp_B*dp_rank, dp_B*(dp_rank+1))
+#     wp_label = label[slice_dp, slice_row, slice_hc, :, :]
+#     loss = F.mse_loss(label, out)
+#     wp_loss = F.mse_loss(wp_label, wp_out)
+#     wp_loss_tmp = wp_loss.detach().clone()
+#     dist.all_reduce(wp_loss_tmp, op=dist.ReduceOp.SUM)
+#     wp_loss_avg = wp_loss_tmp / dist.get_world_size()
+#     print_rank0(f"loss: {loss}")
+#     print_rank0(f"wp_loss_avg: {wp_loss_avg}")
+
+#     ## BWD
+#     loss.backward()
+#     wp_loss.backward()
+#     gathered_grad = gather_3D_shard(
+#         input_shard.grad, device_mesh, dp_dim=0, wp_dim=1, sp_dim=3
+#     )
+#     assert torch.allclose(input.grad, gathered_grad), \
+#         f'the diff norm is: {torch.norm(input.grad-gathered_grad)}'
+
+#     print_rank0('passed test_3D_bwd')
 
 
 if __name__ == "__main__":
     torch.manual_seed(42999)
-    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_dtype(torch.float32)
     logging.basicConfig(level=logging.INFO)
 
     # setup parallel settings for ulysses, WP
     input, input_shard, device_mesh, args = \
         setup(ulysses_degree=2, window_parallelism_degree=2)
     
-    test_window_parallel_shift(input, input_shard, device_mesh, args)
-    test_window_parallel_shift_and_rev_shift(input, input_shard, device_mesh, args)
-    test_ulysses(input, input_shard, device_mesh, args)
+    # test_window_parallel_shift(input, input_shard, device_mesh, args)
+    # test_window_parallel_shift_and_rev_shift(input, input_shard, device_mesh, args)
+    # test_ulysses(input, input_shard, device_mesh, args)
+    test_WP_bwd(input, input_shard, device_mesh, args)
+    # test_WP_fwd_bwd(input, input_shard, device_mesh, args)
+    # test_3D_fwd_bwd(input, input_shard, device_mesh, args)
