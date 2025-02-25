@@ -1,3 +1,5 @@
+"""Boilerplate code for device agnostic torch"""
+
 import torch
 import torch.distributed as dist
 import time
@@ -24,7 +26,9 @@ def get_device_count():
     elif torch.xpu.is_available():
         return torch.xpu.device_count()
     else:
-        raise KeyboardInterrupt()
+        print_rank0("WARNING: For test purposes, setting local world_size to 12")
+        return 12
+        # raise KeyboardInterrupt()
     
 
 def print_in_order(msg, **kwargs):
@@ -32,7 +36,7 @@ def print_in_order(msg, **kwargs):
     WORLD_SIZE = dist.get_world_size()
     for i in range(WORLD_SIZE):
         if RANK == i:
-            print(f"{RANK}: {msg}")
+            print(f"{RANK}: {msg}", flush=True)
         dist.barrier()
 
 
